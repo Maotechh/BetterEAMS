@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         BetterEAMS
 // @namespace    https://github.com/henryli/bettereams
-// @version      0.9.26
+// @version      0.9.27
 // @description  Improve ShanghaiTech EAMS course search, filtering, layout, favorites, and schedule conflict checks.
 // @author       BetterEAMS
 // @homepageURL  https://github.com/Maotechh/BetterEAMS
@@ -15,6 +15,8 @@
 // @run-at       document-start
 // @noframes
 // @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @connect      coursebench.org
 // ==/UserScript==
 
 (function () {
@@ -26,6 +28,13 @@
   const FAVORITES_KEY = `${APP_ID}:favorites:v1`;
   const PLANS_KEY = `${APP_ID}:plans:v1`;
   const API_TEMPLATES_KEY = `${APP_ID}:api-templates:v1`;
+  const COURSEBENCH_CACHE_KEY = `${APP_ID}:coursebench:v1`;
+  const COURSEBENCH_API_URL = "https://coursebench.org/v1/course/all";
+  const COURSEBENCH_ORIGIN = "https://coursebench.org";
+  const COURSEBENCH_CACHE_TTL = 6 * 60 * 60 * 1000;
+  const COURSEBENCH_RETRY_DELAY = 5 * 60 * 1000;
+  const COURSEBENCH_ENOUGH_DATA_THRESHOLD = 3;
+  const COURSEBENCH_SCORE_LABELS = ["课程质量", "作业用时", "考核难度", "给分情况"];
   const PLAN_COMPLETION_PATH = "/eams/myPlanCompl.action";
   const PREFERRED_EAMS_LOCALE = "zh_CN";
   const LESSON_ARRAY_NAMES = ["lessonJSONs", "takedLessonsStr", "otherTakedLessonsStr"];
@@ -124,6 +133,13 @@
   let favorites = new Set(readJson(FAVORITES_KEY, []));
   let planStore = normalizePlanStore(readJson(PLANS_KEY, null));
   let apiTemplates = readJson(API_TEMPLATES_KEY, []);
+  const cachedCourseBench = readJson(COURSEBENCH_CACHE_KEY, {});
+  let courseBenchCatalog = buildCourseBenchCatalog(cachedCourseBench?.courses);
+  let courseBenchFetchedAt = toNumber(cachedCourseBench?.fetchedAt);
+  let courseBenchLastAttemptAt = 0;
+  let courseBenchLoading = false;
+  let courseBenchLoaded = courseBenchCatalog.size > 0;
+  let courseBenchError = "";
   let lessonCatalog = new Map();
   let lessons = [];
   let studentCourseCategories = emptyStudentCourseCategories();
@@ -438,12 +454,14 @@
     lessons = mergeIntoCatalog(found.map(normalizeLesson));
     rowIndex = indexRows(lessons);
     attachCurriculumPlanMarks();
+    attachCourseBenchRatings();
     lastSignature = pageSignature();
     hideLegacyCourseLists();
     updateFilterOptions();
     render();
     updateDebugState();
     ensureCurriculumPlanLoaded();
+    ensureCourseBenchLoaded();
   }
 
   function emptyElectionState() {
@@ -1188,6 +1206,117 @@
     return score;
   }
 
+  async function ensureCourseBenchLoaded(force = false) {
+    const now = Date.now();
+    const cacheFresh = courseBenchCatalog.size > 0 && now - courseBenchFetchedAt < COURSEBENCH_CACHE_TTL;
+    const retryCoolingDown = courseBenchError && now - courseBenchLastAttemptAt < COURSEBENCH_RETRY_DELAY;
+    if (courseBenchLoading || (!force && (cacheFresh || retryCoolingDown))) return;
+
+    courseBenchLastAttemptAt = now;
+    courseBenchLoading = true;
+    courseBenchError = "";
+    render();
+    try {
+      const courses = await requestCourseBenchCourses();
+      const catalog = buildCourseBenchCatalog(courses);
+      if (!catalog.size) throw new Error("CourseBench 没有返回课程数据");
+
+      courseBenchCatalog = catalog;
+      courseBenchFetchedAt = Date.now();
+      courseBenchLoaded = true;
+      writeJson(COURSEBENCH_CACHE_KEY, {
+        fetchedAt: courseBenchFetchedAt,
+        courses: [...courseBenchCatalog.values()]
+      });
+    } catch (error) {
+      courseBenchError = error?.message || "读取失败";
+      console.warn("[BetterEAMS] Failed to read CourseBench ratings.", error);
+    } finally {
+      courseBenchLoading = false;
+      attachCourseBenchRatings();
+      render();
+      updateDebugState();
+    }
+  }
+
+  function requestCourseBenchCourses() {
+    if (typeof GM_xmlhttpRequest === "function") {
+      return new Promise((resolve, reject) => {
+        GM_xmlhttpRequest({
+          method: "GET",
+          url: COURSEBENCH_API_URL,
+          headers: { "Accept": "application/json" },
+          anonymous: true,
+          timeout: 15000,
+          onload: (response) => {
+            if (response.status < 200 || response.status >= 300) {
+              reject(new Error(`CourseBench HTTP ${response.status}`));
+              return;
+            }
+            try {
+              const payload = JSON.parse(response.responseText || "{}");
+              if (payload.error || !Array.isArray(payload.data)) throw new Error("CourseBench 响应格式异常");
+              resolve(payload.data);
+            } catch (error) {
+              reject(error);
+            }
+          },
+          onerror: () => reject(new Error("无法连接 CourseBench")),
+          ontimeout: () => reject(new Error("CourseBench 请求超时"))
+        });
+      });
+    }
+
+    return fetch(COURSEBENCH_API_URL, {
+      method: "GET",
+      credentials: "omit",
+      headers: { "Accept": "application/json" }
+    }).then(async (response) => {
+      if (!response.ok) throw new Error(`CourseBench HTTP ${response.status}`);
+      const payload = await response.json();
+      if (payload.error || !Array.isArray(payload.data)) throw new Error("CourseBench 响应格式异常");
+      return payload.data;
+    });
+  }
+
+  function buildCourseBenchCatalog(courses) {
+    const catalog = new Map();
+    if (!Array.isArray(courses)) return catalog;
+    for (const raw of courses) {
+      const course = normalizeCourseBenchCourse(raw);
+      if (!course) continue;
+      const current = catalog.get(course.code);
+      if (!current || course.commentCount > current.commentCount) catalog.set(course.code, course);
+    }
+    return catalog;
+  }
+
+  function normalizeCourseBenchCourse(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const id = toNumber(raw.id);
+    const code = normalizeCourseCode(raw.code);
+    const sourceScores = Array.isArray(raw.score) ? raw.score : raw.scores;
+    if (!id || !code || !Array.isArray(sourceScores) || sourceScores.length < 4) return null;
+    const scores = sourceScores.slice(0, 4).map((value) => {
+      const score = Number(value);
+      return Number.isFinite(score) ? Math.min(5, Math.max(0, score)) : 0;
+    });
+    return {
+      id,
+      code,
+      name: asText(raw.name),
+      scores,
+      commentCount: Math.max(0, toNumber(raw.comment_num ?? raw.commentCount))
+    };
+  }
+
+  function attachCourseBenchRatings() {
+    for (const item of lessons) {
+      const code = normalizeCourseCode(item.code || item.no);
+      item.courseBenchRating = code ? courseBenchCatalog.get(code) || null : null;
+    }
+  }
+
   async function ensureCurriculumPlanLoaded(force = false) {
     if (isPlanCompletionPage()) return;
     if (curriculumPlanLoading || (curriculumPlanLoaded && !force)) return;
@@ -1688,6 +1817,7 @@
         curriculumPlanLoaded = false;
         curriculumPlanError = "";
         refreshLessons();
+        ensureCourseBenchLoaded(true);
       }
       if (action === "pickSlot") {
         toggleTimetableSlotFilter(button.dataset.day, button.dataset.period);
@@ -2916,6 +3046,7 @@
             </div>
             <div class="beams-meta">${escapeHtml(item.teachers.join("、") || "未标明教师")}</div>
           </div>
+          ${courseBenchScoreHtml(item)}
           ${capacityHtml(item)}
         </div>
         <div class="beams-tags">${tags.map((tag) => `<span>${escapeHtml(tag)}</span>`).join("")}</div>
@@ -3183,6 +3314,72 @@
       html = html.replace(new RegExp(`(${escaped})`, "ig"), "<mark>$1</mark>");
     }
     return html;
+  }
+
+  function courseBenchScoreHtml(item) {
+    const rating = item.courseBenchRating;
+    if (rating) {
+      const enoughData = rating.commentCount >= COURSEBENCH_ENOUGH_DATA_THRESHOLD;
+      const average = courseBenchAverageScore(rating);
+      const scoreText = enoughData ? average.toFixed(1) : "-";
+      const detailText = rating.commentCount ? `${formatPlainNumber(rating.commentCount)} 评价` : "暂无评价";
+      const title = courseBenchScoreTitle(rating, average, enoughData);
+      return `
+        <a
+          class="beams-coursebench ${enoughData ? courseBenchScoreClass(average) : "is-insufficient"}"
+          href="${escapeHtml(`${COURSEBENCH_ORIGIN}/course/${rating.id}`)}"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="${escapeHtml(title)}"
+          aria-label="${escapeHtml(title)}"
+        >
+          <strong>${escapeHtml(scoreText)}</strong>
+          <span>CB · ${escapeHtml(detailText)}</span>
+        </a>
+      `;
+    }
+
+    const status = courseBenchLoading && !courseBenchLoaded ? "读取中" :
+      courseBenchError && !courseBenchLoaded ? "加载失败" :
+      courseBenchLoaded ? "未收录" : "等待读取";
+    const title = courseBenchError && !courseBenchLoaded ?
+      `CourseBench 评分加载失败：${courseBenchError}` :
+      `CourseBench：${status}`;
+    return `
+      <a
+        class="beams-coursebench is-unavailable"
+        href="${COURSEBENCH_ORIGIN}"
+        target="_blank"
+        rel="noopener noreferrer"
+        title="${escapeHtml(title)}"
+        aria-label="${escapeHtml(title)}"
+      >
+        <strong>-</strong>
+        <span>CB · ${escapeHtml(status)}</span>
+      </a>
+    `;
+  }
+
+  function courseBenchAverageScore(rating) {
+    if (!Array.isArray(rating?.scores) || !rating.scores.length) return 0;
+    return rating.scores.reduce((sum, value) => sum + toNumber(value), 0) / rating.scores.length;
+  }
+
+  function courseBenchScoreTitle(rating, average, enoughData) {
+    if (!enoughData) {
+      return `CourseBench 数据不足：${formatPlainNumber(rating.commentCount)} 条评价，至少 ${COURSEBENCH_ENOUGH_DATA_THRESHOLD} 条后显示评分。点击查看课程。`;
+    }
+    const dimensions = COURSEBENCH_SCORE_LABELS
+      .map((label, index) => `${label} ${toNumber(rating.scores[index]).toFixed(1)}`)
+      .join(" · ");
+    return `CourseBench 综合 ${average.toFixed(1)}/5 · ${formatPlainNumber(rating.commentCount)} 条评价 · ${dimensions}。各维度分数越高，分别代表质量更好、作业用时更少、考核更易、给分更好。点击查看详情。`;
+  }
+
+  function courseBenchScoreClass(average) {
+    if (average >= 4.2) return "is-excellent";
+    if (average >= 3.4) return "is-good";
+    if (average >= 2.6) return "is-mixed";
+    return "is-low";
   }
 
   function capacityText(item) {
@@ -4901,6 +5098,11 @@
       studentCategorySource: studentCourseCategories.source,
       rowIndexCount: rowIndex.size,
       apiTemplateCount: apiTemplates.length,
+      courseBenchLoaded,
+      courseBenchLoading,
+      courseBenchError,
+      courseBenchCatalogCount: courseBenchCatalog.size,
+      courseBenchMatchedLessonCount: lessons.filter((item) => Boolean(item.courseBenchRating)).length,
       planGapCount: curriculumPlan.gaps.length,
       planMatchedLessonCount: lessons.filter(hasCurriculumPlanGap).length,
       planActionableGapCount: curriculumPlan.gaps.filter((gap) => gap.kind !== "group" || gap.actionable).length,
@@ -4934,6 +5136,10 @@
     panel.dataset.studentCategoryFallback = state.studentCategoryFallback;
     panel.dataset.rowIndexCount = String(state.rowIndexCount);
     panel.dataset.apiTemplateCount = String(state.apiTemplateCount);
+    panel.dataset.courseBenchLoaded = String(state.courseBenchLoaded);
+    panel.dataset.courseBenchLoading = String(state.courseBenchLoading);
+    panel.dataset.courseBenchCatalogCount = String(state.courseBenchCatalogCount);
+    panel.dataset.courseBenchMatchedLessonCount = String(state.courseBenchMatchedLessonCount);
     panel.dataset.planGapCount = String(state.planGapCount);
     panel.dataset.planMatchedLessonCount = String(state.planMatchedLessonCount);
     panel.dataset.planActionableGapCount = String(state.planActionableGapCount);
@@ -6041,6 +6247,55 @@
       .beams-capacity.is-open { color: var(--beams-open); background: #dcfce7; }
       .beams-capacity.is-tight { color: var(--beams-warning); background: #fef3c7; }
       .beams-capacity.is-full { color: var(--beams-danger); background: #fee2e2; }
+      .beams-coursebench {
+        flex: 0 0 auto;
+        width: 72px;
+        min-height: 39px;
+        box-sizing: border-box;
+        border: 1px solid #cbd5e1;
+        border-radius: 7px;
+        padding: 3px 6px;
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        justify-content: center;
+        background: #f8fafc;
+        color: #334155;
+        text-align: right;
+        text-decoration: none;
+        transition: border-color .12s ease, background .12s ease, transform .12s ease;
+      }
+      .beams-coursebench:hover,
+      .beams-coursebench:focus-visible {
+        border-color: #0f766e;
+        background: #f0fdfa;
+        transform: translateY(-1px);
+        outline: none;
+      }
+      .beams-coursebench strong,
+      .beams-coursebench span {
+        display: block;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .beams-coursebench strong {
+        font-size: 16px;
+        line-height: 1.1;
+        font-weight: 800;
+      }
+      .beams-coursebench span {
+        margin-top: 1px;
+        font-size: 9px;
+        line-height: 1.15;
+      }
+      .beams-coursebench.is-excellent { border-color: #86efac; background: #f0fdf4; color: #166534; }
+      .beams-coursebench.is-good { border-color: #93c5fd; background: #eff6ff; color: #1d4ed8; }
+      .beams-coursebench.is-mixed { border-color: #fcd34d; background: #fffbeb; color: #92400e; }
+      .beams-coursebench.is-low { border-color: #fca5a5; background: #fef2f2; color: #b42318; }
+      .beams-coursebench.is-insufficient,
+      .beams-coursebench.is-unavailable { color: #64748b; background: #f8fafc; }
       .beams-tags {
         display: flex;
         flex-wrap: wrap;
